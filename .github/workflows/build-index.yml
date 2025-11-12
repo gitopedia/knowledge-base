@@ -32,4 +32,26 @@ jobs:
           name: index-sqlite
           path: out/index.sqlite
 
+  deploy:
+    needs: build-index
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: index-sqlite
+          path: out
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GITOPEDIA_KB_ROLE_ARN }}
+          aws-region: ${{ secrets.GITOPEDIA_AWS_REGION }}
+      - name: Upload index to S3
+        run: |
+          aws s3 cp out/index.sqlite s3://${{ secrets.GITOPEDIA_KB_INDEX_BUCKET }}/index.sqlite
+
 
