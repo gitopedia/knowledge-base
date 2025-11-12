@@ -9,4 +9,6 @@ This repository is part of the Gitopedia multi-repo project.
 
 For full context and up-to-date guidance, always refer to the main Gitopedia README and docs.
 
+This repository builds and publishes the search index (SQLite) artifact.
+
 
