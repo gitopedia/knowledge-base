@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+  repository_dispatch:
+    types: [ content-updated ]
 
 jobs:
   build-index:
@@ -13,7 +15,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Checkout Gitopedia content
+      - name: Checkout Gitopedia content (dispatched)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          repository: gitopedia/gitopedia
+          path: gitopedia
+          fetch-depth: 0
+          ref: ${{ github.event.client_payload.gitopedia_sha }}
+      - name: Checkout Gitopedia content (default)
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
         with:
           repository: gitopedia/gitopedia
@@ -41,7 +52,7 @@ jobs:
   deploy:
     needs: build-index
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'repository_dispatch'
     permissions:
       id-token: write
       contents: read
@@ -59,5 +70,33 @@ jobs:
       - name: Upload index to S3
         run: |
           aws s3 cp out/index.sqlite s3://${{ secrets.GITOPEDIA_KB_INDEX_BUCKET }}/index.sqlite
+
+  dispatch-website:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.GITOPEDIA_APP_ID }}
+          private_key: ${{ secrets.GITOPEDIA_APP_PRIVATE_KEY }}
+      - name: Dispatch to Website (repository_dispatch)
+        env:
+          SITE_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if [ -z "${SITE_TOKEN}" ]; then
+            echo "GitHub App token not available; skipping dispatch to Website." >&2
+            exit 0
+          fi
+          payload=$(jq -n \
+            --arg kb_sha "${GITHUB_SHA}" \
+            --arg gitopedia_sha "${{ github.event.client_payload.gitopedia_sha || '' }}" \
+            '{event_type:"rebuild-site", client_payload:{kb_sha:$kb_sha, gitopedia_sha:$gitopedia_sha}}')
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${SITE_TOKEN}" \
+            https://api.github.com/repos/gitopedia/website/dispatches \
+            -d "${payload}"
 
 
