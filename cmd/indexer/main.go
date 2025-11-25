@@ -69,6 +69,14 @@ func run() error {
 		return err
 	}
 
+	version := os.Getenv("GITOPEDIA_VERSION")
+	if version == "" {
+		version = "unknown"
+	}
+	if _, err := db.Exec("INSERT OR REPLACE INTO db_info (key, value) VALUES ('version', ?)", version); err != nil {
+		log.Printf("Failed to insert version info: %v", err)
+	}
+
 	count := 0
 	err = filepath.WalkDir(compendiumDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -105,6 +113,7 @@ func initDB(db *sql.DB) error {
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=OFF;",
 		"CREATE TABLE articles (id TEXT PRIMARY KEY, title TEXT, path TEXT, author TEXT, summary TEXT, tags TEXT, meta_json TEXT);",
+		"CREATE TABLE db_info (key TEXT PRIMARY KEY, value TEXT);",
 		"CREATE VIRTUAL TABLE article_index USING fts5(content, title, summary, tags, id UNINDEXED);",
 	}
 	for _, cmd := range cmds {

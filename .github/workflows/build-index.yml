@@ -38,7 +38,7 @@ jobs:
         env:
           GITOPEDIA_DIR: gitopedia/Compendium
         run: |
-          go run cmd/indexer/main.go
+          GITOPEDIA_VERSION=$(cd gitopedia && git rev-parse HEAD) go run cmd/indexer/main.go
       - name: Upload index artifact
         uses: actions/upload-artifact@v4
         with:
