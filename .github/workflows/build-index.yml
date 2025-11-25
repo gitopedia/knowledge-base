@@ -22,7 +22,7 @@ jobs:
           repository: gitopedia/gitopedia
           path: gitopedia
           fetch-depth: 0
-          ref: ${{ github.event.client_payload.gitopedia_sha }}
+          ref: ${{ github.event.client_payload.gitopedia_sha || 'main' }}
       - name: Checkout Gitopedia content (default)
         if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
