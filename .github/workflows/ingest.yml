@@ -32,13 +32,20 @@ jobs:
       - name: Checkout knowledge-base
         uses: actions/checkout@v4
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.GITOPEDIA_APP_ID }}
+          private_key: ${{ secrets.GITOPEDIA_APP_PRIVATE_KEY }}
+
       - name: Checkout gitopedia
         uses: actions/checkout@v4
         with:
           repository: gitopedia/gitopedia
           path: gitopedia
           ref: ${{ github.event.client_payload.gitopedia_sha || 'main' }}
-          token: ${{ secrets.GITOPEDIA_PAT }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Check for sources to ingest
         id: check-sources
@@ -102,8 +109,8 @@ jobs:
         if: steps.check-sources.outputs.has_sources == 'true'
         working-directory: gitopedia
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
+          git config user.name "gitopedia-bot[bot]"
+          git config user.email "gitopedia-bot[bot]@users.noreply.github.com"
           git add -A
           if git diff --staged --quiet; then
             echo "No changes to commit"
