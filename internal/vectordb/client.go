@@ -3,6 +3,7 @@ package vectordb
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -139,7 +140,7 @@ func (c *Client) createCollection(ctx context.Context, name string) error {
 // UpsertSource stores or updates a source embedding
 func (c *Client) UpsertSource(ctx context.Context, id string, embedding []float32, payload SourcePayload) error {
 	point := &qdrant.PointStruct{
-		Id:      qdrant.NewID(id),
+		Id:      qdrant.NewID(toUUID(id)),
 		Vectors: qdrant.NewVectors(embedding...),
 		Payload: qdrant.NewValueMap(map[string]interface{}{
 			"id":         payload.ID,
@@ -163,7 +164,7 @@ func (c *Client) UpsertSource(ctx context.Context, id string, embedding []float3
 // UpsertArticle stores or updates an article embedding
 func (c *Client) UpsertArticle(ctx context.Context, id string, embedding []float32, payload ArticlePayload) error {
 	point := &qdrant.PointStruct{
-		Id:      qdrant.NewID(id),
+		Id:      qdrant.NewID(toUUID(id)),
 		Vectors: qdrant.NewVectors(embedding...),
 		Payload: qdrant.NewValueMap(map[string]interface{}{
 			"id":       payload.ID,
@@ -269,7 +270,7 @@ func (c *Client) DeleteSource(ctx context.Context, id string) error {
 		Points: &qdrant.PointsSelector{
 			PointsSelectorOneOf: &qdrant.PointsSelector_Points{
 				Points: &qdrant.PointsIdsList{
-					Ids: []*qdrant.PointId{qdrant.NewID(id)},
+					Ids: []*qdrant.PointId{qdrant.NewID(toUUID(id))},
 				},
 			},
 		},
@@ -327,5 +328,92 @@ func extractValue(val *qdrant.Value) interface{} {
 	default:
 		return nil
 	}
+}
+
+// toUUID converts a ULID string to UUID format.
+// ULIDs are 128-bit identifiers that can be represented as UUIDs.
+// If the input is already a valid UUID, it's returned as-is.
+// If conversion fails, returns the original string (Qdrant will validate).
+func toUUID(id string) string {
+	// Check if already UUID format (contains hyphens)
+	if len(id) == 36 && id[8] == '-' && id[13] == '-' && id[18] == '-' && id[23] == '-' {
+		return id
+	}
+
+	// Try to parse as ULID (26 characters, Crockford base32)
+	if len(id) != 26 {
+		return id // Not a ULID, return as-is
+	}
+
+	// Decode ULID from Crockford base32 to bytes
+	bytes, err := decodeULID(id)
+	if err != nil {
+		return id // Invalid ULID, return as-is
+	}
+
+	// Format as UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(bytes[0:4]),
+		hex.EncodeToString(bytes[4:6]),
+		hex.EncodeToString(bytes[6:8]),
+		hex.EncodeToString(bytes[8:10]),
+		hex.EncodeToString(bytes[10:16]))
+}
+
+// decodeULID decodes a ULID string (Crockford base32) to 16 bytes
+func decodeULID(s string) ([]byte, error) {
+	if len(s) != 26 {
+		return nil, fmt.Errorf("invalid ULID length: %d", len(s))
+	}
+
+	// Crockford's Base32 decoding table (supports uppercase)
+	dec := map[byte]byte{
+		'0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
+		'A': 10, 'B': 11, 'C': 12, 'D': 13, 'E': 14, 'F': 15, 'G': 16, 'H': 17,
+		'J': 18, 'K': 19, 'M': 20, 'N': 21, 'P': 22, 'Q': 23, 'R': 24, 'S': 25,
+		'T': 26, 'V': 27, 'W': 28, 'X': 29, 'Y': 30, 'Z': 31,
+		// Lowercase
+		'a': 10, 'b': 11, 'c': 12, 'd': 13, 'e': 14, 'f': 15, 'g': 16, 'h': 17,
+		'j': 18, 'k': 19, 'm': 20, 'n': 21, 'p': 22, 'q': 23, 'r': 24, 's': 25,
+		't': 26, 'v': 27, 'w': 28, 'x': 29, 'y': 30, 'z': 31,
+		// Common substitutions
+		'O': 0, 'o': 0, 'I': 1, 'i': 1, 'L': 1, 'l': 1,
+	}
+
+	// Decode all 26 characters to 5-bit values
+	var vals [26]byte
+	for i := 0; i < 26; i++ {
+		v, ok := dec[s[i]]
+		if !ok {
+			return nil, fmt.Errorf("invalid ULID character: %c", s[i])
+		}
+		vals[i] = v
+	}
+
+	// Pack 26 * 5 = 130 bits into 16 bytes (128 bits used, 2 MSBs of first char ignored)
+	// ULID layout: 10 chars timestamp (48 bits) + 16 chars randomness (80 bits)
+	var result [16]byte
+
+	// Timestamp: chars 0-9 -> bytes 0-5 (48 bits)
+	result[0] = (vals[0] << 5) | vals[1]
+	result[1] = (vals[2] << 3) | (vals[3] >> 2)
+	result[2] = (vals[3] << 6) | (vals[4] << 1) | (vals[5] >> 4)
+	result[3] = (vals[5] << 4) | (vals[6] >> 1)
+	result[4] = (vals[6] << 7) | (vals[7] << 2) | (vals[8] >> 3)
+	result[5] = (vals[8] << 5) | vals[9]
+
+	// Randomness: chars 10-25 -> bytes 6-15 (80 bits)
+	result[6] = (vals[10] << 3) | (vals[11] >> 2)
+	result[7] = (vals[11] << 6) | (vals[12] << 1) | (vals[13] >> 4)
+	result[8] = (vals[13] << 4) | (vals[14] >> 1)
+	result[9] = (vals[14] << 7) | (vals[15] << 2) | (vals[16] >> 3)
+	result[10] = (vals[16] << 5) | vals[17]
+	result[11] = (vals[18] << 3) | (vals[19] >> 2)
+	result[12] = (vals[19] << 6) | (vals[20] << 1) | (vals[21] >> 4)
+	result[13] = (vals[21] << 4) | (vals[22] >> 1)
+	result[14] = (vals[22] << 7) | (vals[23] << 2) | (vals[24] >> 3)
+	result[15] = (vals[24] << 5) | vals[25]
+
+	return result[:], nil
 }
 
