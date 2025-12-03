@@ -1,0 +1,84 @@
+name: Ingest Sources
+
+on:
+  repository_dispatch:
+    types: [gitopedia-update]
+  workflow_dispatch:
+    inputs:
+      delete_after:
+        description: 'Delete source files after ingestion'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    
+    services:
+      qdrant:
+        image: qdrant/qdrant:latest
+        ports:
+          - 6333:6333
+          - 6334:6334
+      
+      ollama:
+        image: ollama/ollama:latest
+        ports:
+          - 11434:11434
+
+    steps:
+      - name: Checkout knowledge-base
+        uses: actions/checkout@v4
+
+      - name: Checkout gitopedia
+        uses: actions/checkout@v4
+        with:
+          repository: gitopedia/gitopedia
+          path: gitopedia
+          token: ${{ secrets.GITOPEDIA_PAT }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Pull embedding model
+        run: |
+          # Wait for Ollama to be ready
+          sleep 10
+          curl -X POST http://localhost:11434/api/pull -d '{"name": "nomic-embed-text"}'
+
+      - name: Build ingest tool
+        run: go build -o ingest ./cmd/ingest
+
+      - name: Run ingestion
+        env:
+          GITOPEDIA_DIR: ./gitopedia/Compendium
+          KB_DB_PATH: ./out/knowledge.sqlite
+          QDRANT_HOST: localhost
+          QDRANT_PORT: 6334
+          OLLAMA_URL: http://localhost:11434
+        run: |
+          ./ingest \
+            -sources ./gitopedia/Compendium/_incoming/sources \
+            -db ./out/knowledge.sqlite \
+            ${{ github.event.inputs.delete_after == 'true' && '-delete' || '' }}
+
+      - name: Commit changes to gitopedia
+        if: github.event.inputs.delete_after == 'true'
+        working-directory: gitopedia
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "chore: remove ingested source files"
+          git push
+
+      - name: Upload database artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: knowledge-db
+          path: out/knowledge.sqlite
+          retention-days: 30
+
