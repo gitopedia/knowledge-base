@@ -2,6 +2,12 @@ name: Build Knowledgebase Index
 
 on:
   workflow_dispatch:
+    inputs:
+      with_embeddings:
+        description: 'Generate embeddings (requires Qdrant and Ollama)'
+        required: false
+        default: 'false'
+        type: boolean
   push:
     branches: [ main ]
   repository_dispatch:
@@ -15,6 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Checkout Gitopedia content (dispatched)
         if: github.event_name == 'repository_dispatch'
         uses: actions/checkout@v4
@@ -23,6 +30,7 @@ jobs:
           path: gitopedia
           fetch-depth: 0
           ref: ${{ github.event.client_payload.gitopedia_sha || 'main' }}
+
       - name: Checkout Gitopedia content (default)
         if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
@@ -30,20 +38,28 @@ jobs:
           repository: gitopedia/gitopedia
           path: gitopedia
           fetch-depth: 0
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.23'
+
+      - name: Build indexer
+        run: go build -o indexer ./cmd/indexer
+
       - name: Build index
         env:
-          GITOPEDIA_DIR: gitopedia/Compendium
+          GITOPEDIA_VERSION: ${{ github.event.client_payload.gitopedia_sha || github.sha }}
         run: |
-          GITOPEDIA_VERSION=$(cd gitopedia && git rev-parse HEAD) go run cmd/indexer/main.go
+          ./indexer \
+            -compendium gitopedia/Compendium \
+            -db out/knowledge.sqlite
+
       - name: Upload index artifact
         uses: actions/upload-artifact@v4
         with:
           name: index-sqlite
-          path: out/index.sqlite
+          path: out/knowledge.sqlite
 
   deploy:
     needs: build-index
@@ -58,14 +74,16 @@ jobs:
         with:
           name: index-sqlite
           path: out
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.GITOPEDIA_KB_ROLE_ARN }}
           aws-region: ${{ secrets.GITOPEDIA_AWS_REGION }}
+
       - name: Upload index to S3
         run: |
-          aws s3 cp out/index.sqlite s3://${{ secrets.GITOPEDIA_KB_INDEX_BUCKET }}/index.sqlite
+          aws s3 cp out/knowledge.sqlite s3://${{ secrets.GITOPEDIA_KB_INDEX_BUCKET }}/knowledge.sqlite
 
   dispatch-website:
     needs: deploy

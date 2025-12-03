@@ -1,8 +1,11 @@
+// Package main provides the article indexer for the knowledge-base.
+// It walks the Compendium directory, parses markdown files with frontmatter,
+// and builds a searchable SQLite index.
 package main
 
 import (
-	"database/sql"
-	"encoding/json"
+	"context"
+	"flag"
 	"fmt"
 	"io/fs"
 	"log"
@@ -10,10 +13,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	_ "modernc.org/sqlite"
+	"github.com/gitopedia/knowledge-base/internal/database"
+	"github.com/gitopedia/knowledge-base/internal/embedding"
+	"github.com/gitopedia/knowledge-base/internal/vectordb"
 	"gopkg.in/yaml.v3"
 )
 
+// FrontMatter represents the YAML front matter of an article
 type FrontMatter struct {
 	ID      string   `yaml:"id"`
 	Title   string   `yaml:"title"`
@@ -25,64 +31,92 @@ type FrontMatter struct {
 }
 
 func main() {
-	if err := run(); err != nil {
+	// Flags
+	dbPath := flag.String("db", "", "Path to SQLite database")
+	compendiumDir := flag.String("compendium", "", "Path to Compendium directory")
+	withEmbeddings := flag.Bool("embeddings", false, "Generate embeddings and store in Qdrant")
+	flag.Parse()
+
+	if err := run(*dbPath, *compendiumDir, *withEmbeddings); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run() error {
-	// Default paths
-	// knowledge-base/cmd/indexer -> knowledge-base
-	kbRoot, err := os.Getwd() 
+func run(dbPath, compendiumDir string, withEmbeddings bool) error {
+	// Determine paths
+	kbRoot, err := os.Getwd()
 	if err != nil {
 		return err
 	}
-	
-	// assume run from knowledge-base root
-	outDir := filepath.Join(kbRoot, "out")
-	dbPath := filepath.Join(outDir, "index.sqlite")
-	
-	// Default compendium path: ../gitopedia/Compendium
-	compendiumDir := os.Getenv("GITOPEDIA_DIR")
-	if compendiumDir == "" {
-		compendiumDir = filepath.Join(kbRoot, "../gitopedia/Compendium")
+
+	if dbPath == "" {
+		dbPath = os.Getenv("KB_DB_PATH")
+		if dbPath == "" {
+			dbPath = filepath.Join(kbRoot, "out", "knowledge.sqlite")
+		}
 	}
-	
+
+	if compendiumDir == "" {
+		compendiumDir = os.Getenv("GITOPEDIA_DIR")
+		if compendiumDir == "" {
+			compendiumDir = filepath.Join(kbRoot, "../gitopedia/Compendium")
+		}
+	}
+
+	log.Printf("Database path: %s", dbPath)
+	log.Printf("Compendium directory: %s", compendiumDir)
+	log.Printf("Generate embeddings: %v", withEmbeddings)
+
 	if _, err := os.Stat(compendiumDir); os.IsNotExist(err) {
 		return fmt.Errorf("compendium dir not found: %s", compendiumDir)
 	}
 
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		return err
-	}
-
-	// Remove old DB
-	os.Remove(dbPath)
-
-	db, err := sql.Open("sqlite", dbPath)
+	// Open database (creates if not exists)
+	db, err := database.Open(dbPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open database: %w", err)
 	}
 	defer db.Close()
 
-	if err := initDB(db); err != nil {
-		return err
-	}
-
+	// Set version
 	version := os.Getenv("GITOPEDIA_VERSION")
 	if version == "" {
 		version = "unknown"
 	}
-	if _, err := db.Exec("INSERT OR REPLACE INTO db_info (key, value) VALUES ('version', ?)", version); err != nil {
-		log.Printf("Failed to insert version info: %v", err)
+	if err := db.SetInfo("version", version); err != nil {
+		log.Printf("Warning: failed to set version info: %v", err)
 	}
 
-	count := 0
+	// Initialize embedding and vector clients if needed
+	var embedder *embedding.Client
+	var vectorDB *vectordb.Client
+	if withEmbeddings {
+		embedder = embedding.NewClient()
+		log.Printf("Embedding model: %s", embedder.Model())
+
+		vectorDB, err = vectordb.NewClient()
+		if err != nil {
+			return fmt.Errorf("failed to connect to Qdrant: %w", err)
+		}
+		defer vectorDB.Close()
+
+		ctx := context.Background()
+		if err := vectorDB.EnsureCollections(ctx); err != nil {
+			return fmt.Errorf("failed to ensure Qdrant collections: %w", err)
+		}
+	}
+
+	// Walk and index articles
+	var count, skipped, errors int
 	err = filepath.WalkDir(compendiumDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
+			// Skip _incoming and _debug directories
+			if d.Name() == "_incoming" || d.Name() == "_debug" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
@@ -92,8 +126,9 @@ func run() error {
 			return nil
 		}
 
-		if err := processFile(db, compendiumDir, path); err != nil {
-			log.Printf("Error processing %s: %v", path, err)
+		if err := processArticle(db, embedder, vectorDB, compendiumDir, path, withEmbeddings); err != nil {
+			log.Printf("Error processing %s: %v", filepath.Base(path), err)
+			errors++
 		} else {
 			count++
 		}
@@ -104,32 +139,22 @@ func run() error {
 		return err
 	}
 
-	log.Printf("Built index with %d articles at %s", count, dbPath)
+	log.Printf("Indexing complete: %d articles indexed, %d skipped, %d errors", count, skipped, errors)
+
+	// Log stats
+	articleCount, _ := db.CountArticles()
+	sourceCount, _ := db.CountSources()
+	log.Printf("Database stats: %d articles, %d sources", articleCount, sourceCount)
+
 	return nil
 }
 
-func initDB(db *sql.DB) error {
-	cmds := []string{
-		"PRAGMA journal_mode=WAL;",
-		"PRAGMA synchronous=OFF;",
-		"CREATE TABLE articles (id TEXT PRIMARY KEY, title TEXT, path TEXT, author TEXT, summary TEXT, tags TEXT, meta_json TEXT);",
-		"CREATE TABLE db_info (key TEXT PRIMARY KEY, value TEXT);",
-		"CREATE VIRTUAL TABLE article_index USING fts5(content, title, summary, tags, id UNINDEXED);",
-	}
-	for _, cmd := range cmds {
-		if _, err := db.Exec(cmd); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func processFile(db *sql.DB, root, path string) error {
+func processArticle(db *database.DB, embedder *embedding.Client, vectorDB *vectordb.Client, root, path string, withEmbeddings bool) error {
 	contentBytes, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	
+
 	fm, body, err := parse(contentBytes)
 	if err != nil {
 		return err
@@ -162,31 +187,74 @@ func processFile(db *sql.DB, root, path string) error {
 		id = relPath
 	}
 
-	tagsJSON, _ := json.Marshal(fm.Tags)
-	// Reconstruct full meta map for storage
+	// Extract category from path
+	category := ""
+	parts := strings.Split(relPath, "/")
+	if len(parts) > 1 {
+		category = strings.Join(parts[:len(parts)-1], "/")
+	}
+
+	// Build meta map
 	meta := make(map[string]interface{})
 	meta["id"] = fm.ID
 	meta["title"] = fm.Title
 	meta["author"] = fm.Author
 	meta["summary"] = fm.Summary
 	meta["tags"] = fm.Tags
+	meta["category"] = category
 	for k, v := range fm.Rest {
 		meta[k] = v
 	}
-	metaJSON, _ := json.Marshal(meta)
 
-	tagsStr := strings.Join(fm.Tags, " ")
+	// Insert into database
+	article := database.Article{
+		ID:      id,
+		Title:   fm.Title,
+		Path:    relPath,
+		Author:  fm.Author,
+		Summary: fm.Summary,
+		Tags:    fm.Tags,
+		Meta:    meta,
+		Content: body,
+	}
 
-	_, err = db.Exec("INSERT INTO articles (id, title, path, author, summary, tags, meta_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		id, fm.Title, relPath, fm.Author, fm.Summary, string(tagsJSON), string(metaJSON))
-	if err != nil {
+	if err := db.InsertArticle(article); err != nil {
 		return fmt.Errorf("insert article failed: %w", err)
 	}
 
-	_, err = db.Exec("INSERT INTO article_index (content, title, summary, tags, id) VALUES (?, ?, ?, ?, ?)",
-		body, fm.Title, fm.Summary, tagsStr, id)
-	if err != nil {
-		return fmt.Errorf("insert index failed: %w", err)
+	// Generate and store embedding if enabled
+	if withEmbeddings && embedder != nil && vectorDB != nil {
+		// Create text for embedding (title + summary + first part of content)
+		embeddingText := fm.Title
+		if fm.Summary != "" {
+			embeddingText += " " + fm.Summary
+		}
+		if len(body) > 0 {
+			// Add first 1000 chars of body
+			bodyPreview := body
+			if len(bodyPreview) > 1000 {
+				bodyPreview = bodyPreview[:1000]
+			}
+			embeddingText += " " + bodyPreview
+		}
+
+		ctx := context.Background()
+		emb, err := embedder.Embed(ctx, embeddingText)
+		if err != nil {
+			log.Printf("Warning: failed to generate embedding for %s: %v", id, err)
+		} else {
+			payload := vectordb.ArticlePayload{
+				ID:       id,
+				Title:    fm.Title,
+				Path:     relPath,
+				Summary:  fm.Summary,
+				Tags:     fm.Tags,
+				Category: category,
+			}
+			if err := vectorDB.UpsertArticle(ctx, id, emb, payload); err != nil {
+				log.Printf("Warning: failed to store embedding for %s: %v", id, err)
+			}
+		}
 	}
 
 	return nil
@@ -201,11 +269,11 @@ func parse(content []byte) (FrontMatter, string, error) {
 		parts := strings.SplitN(s, "---", 3)
 		if len(parts) >= 3 {
 			if err := yaml.Unmarshal([]byte(parts[1]), &fm); err != nil {
-				// log warning?
+				// Continue with empty frontmatter
+				log.Printf("Warning: failed to parse frontmatter: %v", err)
 			}
-			body = parts[2]
+			body = strings.TrimSpace(parts[2])
 		}
 	}
 	return fm, body, nil
 }
-
