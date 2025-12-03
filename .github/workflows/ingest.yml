@@ -1,14 +1,15 @@
 name: Ingest Sources
 
 on:
+  # Triggered by gitopedia repo when content changes
   repository_dispatch:
-    types: [gitopedia-update]
+    types: [content-updated, gitopedia-update]
   workflow_dispatch:
     inputs:
       delete_after:
         description: 'Delete source files after ingestion'
         required: false
-        default: 'false'
+        default: 'true'
         type: boolean
 
 jobs:
@@ -36,23 +37,47 @@ jobs:
         with:
           repository: gitopedia/gitopedia
           path: gitopedia
+          ref: ${{ github.event.client_payload.gitopedia_sha || 'main' }}
           token: ${{ secrets.GITOPEDIA_PAT }}
 
+      - name: Check for sources to ingest
+        id: check-sources
+        run: |
+          if [ -d "gitopedia/Compendium/_incoming/sources" ] && [ "$(ls -A gitopedia/Compendium/_incoming/sources 2>/dev/null)" ]; then
+            echo "has_sources=true" >> $GITHUB_OUTPUT
+            echo "Found sources to ingest"
+          else
+            echo "has_sources=false" >> $GITHUB_OUTPUT
+            echo "No sources to ingest"
+          fi
+
       - name: Setup Go
+        if: steps.check-sources.outputs.has_sources == 'true'
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
 
       - name: Pull embedding model
+        if: steps.check-sources.outputs.has_sources == 'true'
         run: |
           # Wait for Ollama to be ready
-          sleep 10
+          for i in {1..30}; do
+            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+              echo "Ollama is ready"
+              break
+            fi
+            echo "Waiting for Ollama... ($i/30)"
+            sleep 2
+          done
+          # Pull the embedding model
           curl -X POST http://localhost:11434/api/pull -d '{"name": "nomic-embed-text"}'
 
       - name: Build ingest tool
+        if: steps.check-sources.outputs.has_sources == 'true'
         run: go build -o ingest ./cmd/ingest
 
       - name: Run ingestion
+        if: steps.check-sources.outputs.has_sources == 'true'
         env:
           GITOPEDIA_DIR: ./gitopedia/Compendium
           KB_DB_PATH: ./out/knowledge.sqlite
@@ -60,22 +85,35 @@ jobs:
           QDRANT_PORT: 6334
           OLLAMA_URL: http://localhost:11434
         run: |
+          DELETE_FLAG=""
+          # Default to delete for repository_dispatch, respect input for workflow_dispatch
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            DELETE_FLAG="-delete"
+          elif [ "${{ github.event.inputs.delete_after }}" = "true" ]; then
+            DELETE_FLAG="-delete"
+          fi
+          
           ./ingest \
             -sources ./gitopedia/Compendium/_incoming/sources \
             -db ./out/knowledge.sqlite \
-            ${{ github.event.inputs.delete_after == 'true' && '-delete' || '' }}
+            $DELETE_FLAG
 
       - name: Commit changes to gitopedia
-        if: github.event.inputs.delete_after == 'true'
+        if: steps.check-sources.outputs.has_sources == 'true'
         working-directory: gitopedia
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "chore: remove ingested source files"
-          git push
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: remove ingested source files [skip ci]"
+            git push
+          fi
 
       - name: Upload database artifact
+        if: steps.check-sources.outputs.has_sources == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: knowledge-db
